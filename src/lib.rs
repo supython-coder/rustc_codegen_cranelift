@@ -1,4 +1,4 @@
-#![feature(rustc_private, decl_macro, type_alias_impl_trait, associated_type_bounds, never_type)]
+#![feature(rustc_private, decl_macro, type_alias_impl_trait, associated_type_bounds, never_type, vec_into_raw_parts)]
 #![allow(intra_doc_link_resolution_failure)]
 
 extern crate flate2;
@@ -301,4 +301,14 @@ fn build_isa(sess: &Session, enable_pic: bool) -> Box<dyn isa::TargetIsa + 'stat
 #[no_mangle]
 pub fn __rustc_codegen_backend() -> Box<dyn CodegenBackend> {
     Box::new(CraneliftCodegenBackend)
+}
+
+#[no_mangle]
+pub extern "C" fn __clif_jit_fn(instance_ptr: *const Instance<'static>) -> *const u8 {
+    rustc::ty::tls::with(|tcx| {
+        // lift is used to ensure the correct lifetime for instance.
+        let instance = tcx.lift(unsafe { &*instance_ptr }).unwrap();
+
+        panic!("{:?}", instance);
+    })
 }

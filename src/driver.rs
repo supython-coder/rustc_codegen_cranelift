@@ -359,7 +359,42 @@ fn trans_mono_item<'clif, 'tcx, B: Backend + 'static>(
                 }
             });
 
-            cx.tcx.sess.time("codegen fn", || crate::base::trans_fn(cx, inst, linkage));
+            let pointer_type = cx.module.target_config().pointer_type();
+
+            let (name, sig) = crate::abi::get_function_name_and_sig(tcx, cx.module.isa().triple(), inst, true);
+            let func_id = cx.module
+                .declare_function(&name, Linkage::Export, &sig)
+                .unwrap();
+
+            let instance_ptr = Box::into_raw(Box::new(inst));
+
+            let jit_fn = cx.module.declare_function("__clif_jit_fn", Linkage::Import, &Signature {
+                call_conv: cx.module.target_config().default_call_conv,
+                params: vec![AbiParam::new(pointer_type)],
+                returns: vec![AbiParam::new(pointer_type)],
+            }).unwrap();
+
+            let mut trampoline = Function::with_name_signature(ExternalName::default(), sig.clone());
+            let mut builder_ctx = FunctionBuilderContext::new();
+            let mut trampoline_builder = FunctionBuilder::new(&mut trampoline, &mut builder_ctx);
+
+            let jit_fn = cx.module.declare_func_in_func(jit_fn, trampoline_builder.func);
+            let sig_ref = trampoline_builder.func.import_signature(sig);
+
+            let entry_ebb = trampoline_builder.create_ebb();
+            trampoline_builder.append_ebb_params_for_function_params(entry_ebb);
+            let fn_args = trampoline_builder.func.dfg.ebb_params(entry_ebb).to_vec();
+
+            trampoline_builder.switch_to_block(entry_ebb);
+            let instance_ptr = trampoline_builder.ins().iconst(pointer_type, instance_ptr as u64 as i64);
+            let jitted_fn = trampoline_builder.ins().call(jit_fn, &[instance_ptr]);
+            let jitted_fn = trampoline_builder.func.dfg.inst_results(jitted_fn)[0];
+            trampoline_builder.ins().call_indirect(sig_ref, jitted_fn, &fn_args);
+            trampoline_builder.ins().trap(TrapCode::User(0));
+
+            cx.module.define_function(func_id, &mut Context::for_function(trampoline)).unwrap();
+
+            //cx.tcx.sess.time("codegen fn", || crate::base::trans_fn(cx, inst, linkage));
         }
         MonoItem::Static(def_id) => {
             crate::constant::codegen_static(&mut cx.constants_cx, def_id);
