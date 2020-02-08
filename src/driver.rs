@@ -95,6 +95,18 @@ fn run_jit(tcx: TyCtxt<'_>) -> ! {
     std::process::exit(ret);
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[no_mangle]
+pub extern "C" fn __clif_jit_fn(instance_ptr: *const Instance<'static>) -> *const u8 {
+    rustc::ty::tls::with(|tcx| {
+        // lift is used to ensure the correct lifetime for instance.
+        let instance = tcx.lift(unsafe { &*instance_ptr }).unwrap();
+
+        panic!("{:?}", instance);
+    })
+}
+
+
 fn load_imported_symbols_for_jit(tcx: TyCtxt<'_>) -> Vec<(String, *const u8)> {
     use rustc::middle::dependency_format::Linkage;
 

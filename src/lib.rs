@@ -303,12 +303,4 @@ pub fn __rustc_codegen_backend() -> Box<dyn CodegenBackend> {
     Box::new(CraneliftCodegenBackend)
 }
 
-#[no_mangle]
-pub extern "C" fn __clif_jit_fn(instance_ptr: *const Instance<'static>) -> *const u8 {
-    rustc::ty::tls::with(|tcx| {
-        // lift is used to ensure the correct lifetime for instance.
-        let instance = tcx.lift(unsafe { &*instance_ptr }).unwrap();
-
-        panic!("{:?}", instance);
-    })
-}
+pub use driver::__clif_jit_fn;
