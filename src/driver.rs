@@ -120,6 +120,7 @@ use std::cell::RefCell;
 pub extern "C" fn __clif_jit_fn(instance_ptr: *const Instance<'static>) -> *const u8 {
     if let Some(f) = INSTANCE_CODEGEN.with(|instance_codegen| {
         if let Some(&f) = instance_codegen.borrow().get(unsafe { &*instance_ptr }) {
+            println!("Existing @ {:p}", f);
             Some(f)
         } else {
             None
@@ -156,6 +157,8 @@ pub extern "C" fn __clif_jit_fn(instance_ptr: *const Instance<'static>) -> *cons
         EXISTING_SYMBOLS.with(|existing_symbols| {
             existing_symbols.borrow_mut().insert(name, ptr);
         });
+
+        println!("New {:?} @ {:p}", instance, ptr);
 
         ptr
     })
@@ -508,8 +511,9 @@ fn codegen_shim<'tcx>(cx: &mut CodegenCx<'_, 'tcx, impl Backend>, inst: Instance
     let instance_ptr = trampoline_builder.ins().iconst(pointer_type, instance_ptr as u64 as i64);
     let jitted_fn = trampoline_builder.ins().call(jit_fn, &[instance_ptr]);
     let jitted_fn = trampoline_builder.func.dfg.inst_results(jitted_fn)[0];
-    trampoline_builder.ins().call_indirect(sig_ref, jitted_fn, &fn_args);
-    trampoline_builder.ins().trap(TrapCode::User(0));
+    let call_inst = trampoline_builder.ins().call_indirect(sig_ref, jitted_fn, &fn_args);
+    let ret_vals = trampoline_builder.func.dfg.inst_results(call_inst).to_vec();
+    trampoline_builder.ins().return_(&ret_vals);
 
     cx.module.define_function(func_id, &mut Context::for_function(trampoline)).unwrap();
 }
