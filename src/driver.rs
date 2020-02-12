@@ -85,7 +85,7 @@ fn run_jit(tcx: TyCtxt<'_>) -> ! {
         .declare_function("main", Linkage::Import, &sig)
         .unwrap();
 
-    codegen_cgus(tcx, &mut jit_module, &mut None);
+    codegen_cgus(tcx, &mut jit_module, &mut None, true);
     crate::allocator::codegen(tcx, &mut jit_module);
     jit_module.finalize_definitions();
 
@@ -134,18 +134,20 @@ pub extern "C" fn __clif_jit_fn(instance_ptr: *const Instance<'static>) -> *cons
 
         let mut jit_module = make_jit(tcx);
 
-        let mut cx = CodegenCx::new(tcx, &mut jit_module, None);
+        let mut cx = CodegenCx::new(tcx, &mut jit_module, None, false);
 
-        trans_mono_item(&mut cx, MonoItem::Fn(instance), Linkage::Export);
+        trans_mono_item(&mut cx, MonoItem::Fn(instance), Linkage::Export, false);
 
         let (name, sig) = crate::abi::get_function_name_and_sig(tcx, cx.module.isa().triple(), instance, true);
         let func_id = cx.module
             .declare_function(&name, Linkage::Export, &sig)
             .unwrap();
 
-        cx.module.finalize_definitions();
+        cx.finalize();
 
-        let ptr = cx.module.get_finalized_function(func_id);
+        let ptr = jit_module.get_finalized_function(func_id);
+
+        jit_module.finish();
 
         INSTANCE_CODEGEN.with(|instance_codegen| {
             instance_codegen.borrow_mut().insert(unsafe { (&*instance_ptr).clone() }, ptr);
@@ -266,7 +268,7 @@ fn run_aot(
         None
     };
 
-    codegen_cgus(tcx, &mut module, &mut debug);
+    codegen_cgus(tcx, &mut module, &mut debug, false);
 
     tcx.sess.abort_if_errors();
 
@@ -345,6 +347,7 @@ fn codegen_cgus<'tcx>(
     tcx: TyCtxt<'tcx>,
     module: &mut Module<impl Backend + 'static>,
     debug: &mut Option<DebugContext<'tcx>>,
+    make_shim: bool,
 ) {
     let (_, cgus) = tcx.collect_and_partition_mono_items(LOCAL_CRATE);
     let mono_items = cgus
@@ -353,9 +356,9 @@ fn codegen_cgus<'tcx>(
         .flatten()
         .collect::<FxHashMap<_, (_, _)>>();
 
-    codegen_mono_items(tcx, module, debug.as_mut(), mono_items);
-
     crate::main_shim::maybe_create_entry_wrapper(tcx, module);
+
+    codegen_mono_items(tcx, module, debug.as_mut(), mono_items, make_shim);
 }
 
 fn codegen_mono_items<'tcx>(
@@ -363,10 +366,11 @@ fn codegen_mono_items<'tcx>(
     module: &mut Module<impl Backend + 'static>,
     debug_context: Option<&mut DebugContext<'tcx>>,
     mono_items: FxHashMap<MonoItem<'tcx>, (RLinkage, Visibility)>,
+    make_shim: bool,
 ) {
-    let mut cx = CodegenCx::new(tcx, module, debug_context);
+    let mut cx = CodegenCx::new(tcx, module, debug_context, make_shim);
 
-    time(tcx.sess, "codegen mono items", move || {
+    time(tcx.sess, "codegen mono items", || {
         tcx.sess.time("predefine functions", || {
             for (&mono_item, &(linkage, visibility)) in &mono_items {
                 match mono_item {
@@ -381,21 +385,41 @@ fn codegen_mono_items<'tcx>(
             }
         });
 
-        for (mono_item, (linkage, visibility)) in mono_items {
+        for (&mono_item, &(linkage, visibility)) in &mono_items {
             crate::unimpl::try_unimpl(tcx, || {
                 let linkage = crate::linkage::get_clif_linkage(mono_item, linkage, visibility);
-                trans_mono_item(&mut cx, mono_item, linkage);
+                trans_mono_item(&mut cx, mono_item, linkage, make_shim);
             });
         }
 
         tcx.sess.time("finalize CodegenCx", || cx.finalize());
     });
+
+    module.finalize_definitions();
+
+    if make_shim {
+        EXISTING_SYMBOLS.with(|existing_symbols| {
+            for (&mono_item, _) in &mono_items {
+                let inst = match mono_item {
+                    MonoItem::Fn(inst) => inst,
+                    MonoItem::Static(_) | MonoItem::GlobalAsm(_) => continue,
+                };
+                let (name, sig) = crate::abi::get_function_name_and_sig(tcx, module.isa().triple(), inst, true);
+                let func_id = module
+                    .declare_function(&name, Linkage::Export, &sig)
+                    .unwrap();
+                let ptr = module.get_finalized_function(func_id);
+                existing_symbols.borrow_mut().insert(name, *Any::downcast_ref::<*const u8>(&ptr).unwrap());
+            }
+        });
+    }
 }
 
 fn trans_mono_item<'clif, 'tcx, B: Backend + 'static>(
     cx: &mut crate::CodegenCx<'clif, 'tcx, B>,
     mono_item: MonoItem<'tcx>,
     linkage: Linkage,
+    make_shim: bool,
 ) {
     let tcx = cx.tcx;
     match mono_item {
@@ -424,42 +448,11 @@ fn trans_mono_item<'clif, 'tcx, B: Backend + 'static>(
                 }
             });
 
-            let pointer_type = cx.module.target_config().pointer_type();
-
-            let (name, sig) = crate::abi::get_function_name_and_sig(tcx, cx.module.isa().triple(), inst, true);
-            let func_id = cx.module
-                .declare_function(&name, Linkage::Export, &sig)
-                .unwrap();
-
-            let instance_ptr = Box::into_raw(Box::new(inst));
-
-            let jit_fn = cx.module.declare_function("__clif_jit_fn", Linkage::Import, &Signature {
-                call_conv: cx.module.target_config().default_call_conv,
-                params: vec![AbiParam::new(pointer_type)],
-                returns: vec![AbiParam::new(pointer_type)],
-            }).unwrap();
-
-            let mut trampoline = Function::with_name_signature(ExternalName::default(), sig.clone());
-            let mut builder_ctx = FunctionBuilderContext::new();
-            let mut trampoline_builder = FunctionBuilder::new(&mut trampoline, &mut builder_ctx);
-
-            let jit_fn = cx.module.declare_func_in_func(jit_fn, trampoline_builder.func);
-            let sig_ref = trampoline_builder.func.import_signature(sig);
-
-            let entry_ebb = trampoline_builder.create_ebb();
-            trampoline_builder.append_ebb_params_for_function_params(entry_ebb);
-            let fn_args = trampoline_builder.func.dfg.ebb_params(entry_ebb).to_vec();
-
-            trampoline_builder.switch_to_block(entry_ebb);
-            let instance_ptr = trampoline_builder.ins().iconst(pointer_type, instance_ptr as u64 as i64);
-            let jitted_fn = trampoline_builder.ins().call(jit_fn, &[instance_ptr]);
-            let jitted_fn = trampoline_builder.func.dfg.inst_results(jitted_fn)[0];
-            trampoline_builder.ins().call_indirect(sig_ref, jitted_fn, &fn_args);
-            trampoline_builder.ins().trap(TrapCode::User(0));
-
-            cx.module.define_function(func_id, &mut Context::for_function(trampoline)).unwrap();
-
-            //cx.tcx.sess.time("codegen fn", || crate::base::trans_fn(cx, inst, linkage));
+            if make_shim {
+                codegen_shim(cx, inst);
+            } else {
+                cx.tcx.sess.time("codegen fn", || crate::base::trans_fn(cx, inst, linkage));
+            }
         }
         MonoItem::Static(def_id) => {
             crate::constant::codegen_static(&mut cx.constants_cx, def_id);
@@ -480,6 +473,45 @@ fn trans_mono_item<'clif, 'tcx, B: Backend + 'static>(
             }
         }
     }
+}
+
+fn codegen_shim<'tcx>(cx: &mut CodegenCx<'_, 'tcx, impl Backend>, inst: Instance<'tcx>) {
+    let tcx = cx.tcx;
+
+    let pointer_type = cx.module.target_config().pointer_type();
+
+    let (name, sig) = crate::abi::get_function_name_and_sig(tcx, cx.module.isa().triple(), inst, true);
+    let func_id = cx.module
+        .declare_function(&name, Linkage::Export, &sig)
+        .unwrap();
+
+    let instance_ptr = Box::into_raw(Box::new(inst));
+
+    let jit_fn = cx.module.declare_function("__clif_jit_fn", Linkage::Import, &Signature {
+        call_conv: cx.module.target_config().default_call_conv,
+        params: vec![AbiParam::new(pointer_type)],
+        returns: vec![AbiParam::new(pointer_type)],
+    }).unwrap();
+
+    let mut trampoline = Function::with_name_signature(ExternalName::default(), sig.clone());
+    let mut builder_ctx = FunctionBuilderContext::new();
+    let mut trampoline_builder = FunctionBuilder::new(&mut trampoline, &mut builder_ctx);
+
+    let jit_fn = cx.module.declare_func_in_func(jit_fn, trampoline_builder.func);
+    let sig_ref = trampoline_builder.func.import_signature(sig);
+
+    let entry_ebb = trampoline_builder.create_ebb();
+    trampoline_builder.append_ebb_params_for_function_params(entry_ebb);
+    let fn_args = trampoline_builder.func.dfg.ebb_params(entry_ebb).to_vec();
+
+    trampoline_builder.switch_to_block(entry_ebb);
+    let instance_ptr = trampoline_builder.ins().iconst(pointer_type, instance_ptr as u64 as i64);
+    let jitted_fn = trampoline_builder.ins().call(jit_fn, &[instance_ptr]);
+    let jitted_fn = trampoline_builder.func.dfg.inst_results(jitted_fn)[0];
+    trampoline_builder.ins().call_indirect(sig_ref, jitted_fn, &fn_args);
+    trampoline_builder.ins().trap(TrapCode::User(0));
+
+    cx.module.define_function(func_id, &mut Context::for_function(trampoline)).unwrap();
 }
 
 fn time<R>(sess: &Session, name: &'static str, f: impl FnOnce() -> R) -> R {

@@ -145,11 +145,14 @@ impl<'clif, 'tcx, B: Backend + 'static> CodegenCx<'clif, 'tcx, B> {
         tcx: TyCtxt<'tcx>,
         module: &'clif mut Module<B>,
         debug_context: Option<&'clif mut DebugContext<'tcx>>,
+        make_shim: bool,
     ) -> Self {
+        let mut constants_cx = ConstantCx::default();
+        constants_cx.make_shim = make_shim;
         CodegenCx {
             tcx,
             module,
-            constants_cx: ConstantCx::default(),
+            constants_cx,
             cached_context: Context::new(),
             vtables: HashMap::new(),
             debug_context,

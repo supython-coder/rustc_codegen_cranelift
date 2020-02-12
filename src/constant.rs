@@ -20,6 +20,7 @@ use crate::prelude::*;
 pub struct ConstantCx {
     todo: HashSet<TodoItem>,
     done: HashSet<DataId>,
+    pub make_shim: bool,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
@@ -29,7 +30,7 @@ enum TodoItem {
 }
 
 impl ConstantCx {
-    pub fn finalize(mut self, tcx: TyCtxt<'_>, module: &mut Module<impl Backend>) {
+    pub fn finalize(mut self, tcx: TyCtxt<'_>, module: &mut Module<impl Backend + 'static>) {
         //println!("todo {:?}", self.todo);
         define_all_allocs(tcx, module, &mut self);
         //println!("done {:?}", self.done);
@@ -318,8 +319,10 @@ fn cplace_for_dataid<'tcx>(
     CPlace::for_ptr(crate::pointer::Pointer::new(global_ptr), layout)
 }
 
-fn define_all_allocs(tcx: TyCtxt<'_>, module: &mut Module<impl Backend>, cx: &mut ConstantCx) {
+fn define_all_allocs(tcx: TyCtxt<'_>, module: &mut Module<impl Backend + 'static>, cx: &mut ConstantCx) {
     let memory = Memory::<TransPlaceInterpreter>::new(tcx.at(DUMMY_SP), ());
+
+    let mut statics = HashMap::new();
 
     while let Some(todo_item) = pop_set(&mut cx.todo) {
         let (data_id, alloc) = match todo_item {
@@ -353,6 +356,9 @@ fn define_all_allocs(tcx: TyCtxt<'_>, module: &mut Module<impl Backend>, cx: &mu
                         Linkage::Local
                     },
                 );
+
+                statics.insert(def_id, data_id);
+
                 (data_id, alloc)
             }
         };
@@ -415,6 +421,19 @@ fn define_all_allocs(tcx: TyCtxt<'_>, module: &mut Module<impl Backend>, cx: &mu
     }
 
     assert!(cx.todo.is_empty(), "{:?}", cx.todo);
+
+    module.finalize_definitions();
+
+    if cx.make_shim {
+        for (def_id, data_id) in statics {
+            crate::driver::EXISTING_SYMBOLS.with(|existing_symbols| {
+                existing_symbols.borrow_mut().insert(
+                    tcx.symbol_name(Instance::mono(tcx, def_id)).name.as_str().to_string(),
+                    Any::downcast_ref::<(*mut u8, usize)>(&module.get_finalized_data(data_id)).unwrap().0,
+                );
+            });
+        }
+    }
 }
 
 fn pop_set<T: Copy + Eq + ::std::hash::Hash>(set: &mut HashSet<T>) -> Option<T> {
