@@ -8,6 +8,8 @@ use rustc::session::config::{DebugInfo, OutputType};
 use rustc_codegen_ssa::back::linker::LinkerInfo;
 use rustc_codegen_ssa::CrateInfo;
 
+use cranelift_simplejit::{SimpleJITBackend, SimpleJITBuilder};
+
 use crate::prelude::*;
 
 use crate::backend::{Emit, WriteDebugInfo};
@@ -32,10 +34,29 @@ pub fn codegen_crate(
     run_aot(tcx, metadata, need_metadata_module)
 }
 
+thread_local! {
+    pub static EXISTING_SYMBOLS: RefCell<HashMap<String, *const u8>> = RefCell::new(HashMap::new());
+    pub static INSTANCE_CODEGEN: RefCell<HashMap<Instance<'static>, *const u8>> = RefCell::new(HashMap::new());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn make_jit(tcx: TyCtxt<'_>) -> Module<SimpleJITBackend> {
+    let existing_symbols: Vec<_> = EXISTING_SYMBOLS.with(|existing_symbols| {
+        existing_symbols.borrow().iter().map(|(name, &addr)| (name.clone(), addr)).collect()
+    });
+
+    let mut jit_builder = SimpleJITBuilder::with_isa(
+        crate::build_isa(tcx.sess, false),
+        cranelift_module::default_libcall_names(),
+    );
+    jit_builder.symbols(existing_symbols);
+    let jit_module = Module::new(jit_builder);
+    assert_eq!(pointer_ty(tcx), jit_module.target_config().pointer_type());
+    jit_module
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn run_jit(tcx: TyCtxt<'_>) -> ! {
-    use cranelift_simplejit::{SimpleJITBackend, SimpleJITBuilder};
-
     // Rustc opens us without the RTLD_GLOBAL flag, so __cg_clif_global_atomic_mutex will not be
     // exported. We fix this by opening ourself again as global.
     // FIXME remove once atomic_shim is gone
@@ -43,15 +64,12 @@ fn run_jit(tcx: TyCtxt<'_>) -> ! {
     std::mem::forget(libloading::os::unix::Library::open(Some(cg_dylib), libc::RTLD_NOW | libc::RTLD_GLOBAL).unwrap());
 
 
-    let imported_symbols = load_imported_symbols_for_jit(tcx);
+    EXISTING_SYMBOLS.with(|existing_symbols| {
+        assert!(existing_symbols.borrow().is_empty());
+        *existing_symbols.borrow_mut() = load_imported_symbols_for_jit(tcx);
+    });
 
-    let mut jit_builder = SimpleJITBuilder::with_isa(
-        crate::build_isa(tcx.sess, false),
-        cranelift_module::default_libcall_names(),
-    );
-    jit_builder.symbols(imported_symbols);
-    let mut jit_module: Module<SimpleJITBackend> = Module::new(jit_builder);
-    assert_eq!(pointer_ty(tcx), jit_module.target_config().pointer_type());
+    let mut jit_module = make_jit(tcx);
 
     let sig = Signature {
         params: vec![
@@ -95,19 +113,54 @@ fn run_jit(tcx: TyCtxt<'_>) -> ! {
     std::process::exit(ret);
 }
 
+use std::cell::RefCell;
+
 #[cfg(not(target_arch = "wasm32"))]
 #[no_mangle]
 pub extern "C" fn __clif_jit_fn(instance_ptr: *const Instance<'static>) -> *const u8 {
+    if let Some(f) = INSTANCE_CODEGEN.with(|instance_codegen| {
+        if let Some(&f) = instance_codegen.borrow().get(unsafe { &*instance_ptr }) {
+            Some(f)
+        } else {
+            None
+        }
+    }) {
+        return f;
+    }
+
     rustc::ty::tls::with(|tcx| {
         // lift is used to ensure the correct lifetime for instance.
         let instance = tcx.lift(unsafe { &*instance_ptr }).unwrap();
 
-        panic!("{:?}", instance);
+        let mut jit_module = make_jit(tcx);
+
+        let mut cx = CodegenCx::new(tcx, &mut jit_module, None);
+
+        trans_mono_item(&mut cx, MonoItem::Fn(instance), Linkage::Export);
+
+        let (name, sig) = crate::abi::get_function_name_and_sig(tcx, cx.module.isa().triple(), instance, true);
+        let func_id = cx.module
+            .declare_function(&name, Linkage::Export, &sig)
+            .unwrap();
+
+        cx.module.finalize_definitions();
+
+        let ptr = cx.module.get_finalized_function(func_id);
+
+        INSTANCE_CODEGEN.with(|instance_codegen| {
+            instance_codegen.borrow_mut().insert(unsafe { (&*instance_ptr).clone() }, ptr);
+        });
+
+        EXISTING_SYMBOLS.with(|existing_symbols| {
+            existing_symbols.borrow_mut().insert(name, ptr);
+        });
+
+        ptr
     })
 }
 
 
-fn load_imported_symbols_for_jit(tcx: TyCtxt<'_>) -> Vec<(String, *const u8)> {
+fn load_imported_symbols_for_jit(tcx: TyCtxt<'_>) -> HashMap<String, *const u8> {
     use rustc::middle::dependency_format::Linkage;
 
     let mut dylib_paths = Vec::new();
@@ -137,7 +190,7 @@ fn load_imported_symbols_for_jit(tcx: TyCtxt<'_>) -> Vec<(String, *const u8)> {
         }
     }
 
-    let mut imported_symbols = Vec::new();
+    let mut imported_symbols = HashMap::new();
     for path in dylib_paths {
         use object::Object;
         let lib = libloading::Library::new(&path).unwrap();
