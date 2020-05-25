@@ -58,7 +58,7 @@ impl WriteDebugInfo for ObjectProduct {
         id: SectionId,
         data: Vec<u8>,
     ) -> (object::write::SectionId, object::write::SymbolId) {
-        let name = if self.object.format() == target_lexicon::BinaryFormat::Macho {
+        let name = if self.object.format() == object::BinaryFormat::MachO {
             id.name().replace('.', "__") // machO expects __debug_info instead of .debug_info
         } else {
             id.name().to_string()
@@ -110,7 +110,7 @@ impl Emit for ObjectProduct {
 pub(crate) fn with_object(sess: &Session, name: &str, f: impl FnOnce(&mut Object)) -> Vec<u8> {
     let triple = crate::build_isa(sess, true).triple().clone();
     let mut metadata_object =
-        object::write::Object::new(triple.binary_format, triple.architecture);
+        object::write::Object::new(object::BinaryFormat::Coff, object::Architecture::X86_64, object::Endianness::Little);
     metadata_object.add_file_symbol(name.as_bytes().to_vec());
     f(&mut metadata_object);
     metadata_object.write().unwrap()

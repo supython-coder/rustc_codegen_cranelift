@@ -220,7 +220,6 @@ impl<'a> ArchiveBuilder<'a> for ArArchiveBuilder<'a> {
         // Finalize archive
         std::mem::drop(builder);
 
-        /*
         // Run ranlib to be able to link the archive
         let status = std::process::Command::new("x86_64-w64-mingw32-ranlib")
             .arg(self.config.dst)
@@ -230,7 +229,6 @@ impl<'a> ArchiveBuilder<'a> for ArArchiveBuilder<'a> {
         if !status.success() {
             self.config.sess.fatal(&format!("Ranlib exited with code {:?}", status.code()));
         }
-        */
     }
 }
 
