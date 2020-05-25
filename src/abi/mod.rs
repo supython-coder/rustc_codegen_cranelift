@@ -86,7 +86,7 @@ fn clif_sig_from_fn_sig<'tcx>(
     let abi = match sig.abi {
         Abi::System => {
             if tcx.sess.target.target.options.is_like_windows {
-                unimplemented!()
+                Abi::C
             } else {
                 Abi::C
             }
