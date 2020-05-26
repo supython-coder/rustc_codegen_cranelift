@@ -18,6 +18,7 @@ libc = { version = "=0.2.69", default-features = false } # FIXME rustc 1.45.0-ni
 rustc-std-workspace-core = { path = "./sysroot_src/src/tools/rustc-std-workspace-core" }
 rustc-std-workspace-alloc = { path = "./sysroot_src/src/tools/rustc-std-workspace-alloc" }
 rustc-std-workspace-std = { path = "./sysroot_src/src/tools/rustc-std-workspace-std" }
+compiler_builtins = { path = "./compiler-builtins" }
 
 [profile.release]
 debug = true
