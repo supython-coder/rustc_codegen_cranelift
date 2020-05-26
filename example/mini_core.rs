@@ -505,11 +505,8 @@ pub mod libc {
     #[cfg_attr(not(windows), link(name = "c"))]
     #[cfg_attr(windows, link(name = "msvcrt"))]
     extern "C" {
-        #[cfg_attr(windows, link_name = "puts")]
         pub fn puts(s: *const i8) -> i32;
-        #[cfg_attr(windows, link_name = "printf")]
         pub fn printf(format: *const i8, ...) -> i32;
-        #[cfg_attr(windows, link_name = "malloc")]
         pub fn malloc(size: usize) -> *mut u8;
         pub fn free(ptr: *mut u8);
         pub fn memcpy(dst: *mut u8, src: *const u8, size: usize);
