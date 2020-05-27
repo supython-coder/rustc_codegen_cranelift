@@ -124,7 +124,7 @@ pub(crate) fn make_module(sess: &Session, name: String) -> Module<Backend> {
             crate::build_isa(sess, true),
             name + ".o",
             cranelift_module::default_libcall_names(),
-        ),
+        ).unwrap(),
     );
     module
 }
